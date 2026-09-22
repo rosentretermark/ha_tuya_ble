@@ -35,6 +35,13 @@ from homeassistant.helpers.selector import (
 from .tuya_ble import SERVICE_UUIDS, TuyaBLEDeviceCredentials
 
 from .const import (
+    CONF_BLE_CONTROL_ENABLED,
+    CONF_CONNECTION_MODE,
+    CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+    ConnectionMode,
+    DEFAULT_BLE_CONTROL_ENABLED,
+    DEFAULT_CONNECTION_MODE,
+    DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
     TUYA_COUNTRIES,
     TUYA_SMART_APP,
     SMARTLIFE_APP,
@@ -48,6 +55,8 @@ from .const import (
     CONF_ENDPOINT,
     CONF_SEC_KEY,
     DOMAIN,
+    normalize_on_demand_connection_hold_time,
+    validate_on_demand_connection_hold_time,
 )
 from .devices import TuyaBLEData, get_device_readable_name
 from .cloud import HASSTuyaBLEDeviceManager
@@ -170,207 +179,126 @@ class TuyaBLEOptionsFlow(OptionsFlowWithConfigEntry):
     def __init__(self, config_entry: ConfigEntry) -> None:
         """Initialize options flow."""
         super().__init__(config_entry)
+        self._flow_config_entry = config_entry
+
+    @property
+    def _entry(self) -> ConfigEntry:
+        """Return the linked entry across Home Assistant Options Flow APIs."""
+        try:
+            return self.config_entry
+        except (AttributeError, ValueError):
+            return self._flow_config_entry
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         """Manage the options."""
-        return await self.async_step_login(user_input)
-
-    async def async_step_login(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the Tuya IOT platform login step."""
-        errors: dict[str, str] = {}
-        placeholders: dict[str, Any] = {}
-        credentials: TuyaBLEDeviceCredentials | None = None
-        address: str | None = self.config_entry.data.get(CONF_ADDRESS)
-
-        if user_input is not None:
-            entry: TuyaBLEData | None = None
-            domain_data = self.hass.data.get(DOMAIN)
-            if domain_data:
-                entry = domain_data.get(self.config_entry.entry_id)
-            if entry:
-                login_data = await _try_login(
-                    entry.manager,
-                    user_input,
-                    errors,
-                    placeholders,
-                )
-                if login_data:
-                    entry.manager.data.pop(CONF_SEC_KEY, None)
-                    entry.manager.data.update(login_data)
-                    credentials = await entry.manager.get_device_credentials(
-                        address, True, True
-                    )
-                    if credentials:
-                        return self.async_create_entry(
-                            title=self.config_entry.title,
-                            data=entry.manager.data,
-                        )
-
-                    errors["base"] = "device_not_registered"
-
-        if user_input is None:
-            user_input = {}
-            user_input.update(self.config_entry.options)
-
-        return _show_login_form(self, user_input, errors, placeholders)
-
-
-class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for Tuya BLE."""
-
-    VERSION = 1
-
-    def __init__(self) -> None:
-        """Initialize the config flow."""
-        super().__init__()
-        self._discovery_info: BluetoothServiceInfoBleak | None = None
-        self._discovered_devices: dict[str, BluetoothServiceInfoBleak] = {}
-        self._data: dict[str, Any] = {}
-        self._manager: HASSTuyaBLEDeviceManager | None = None
-        self._get_device_info_error = False
-
-    async def async_step_bluetooth(
-        self, discovery_info: BluetoothServiceInfoBleak
-    ) -> FlowResult:
-        """Handle the bluetooth discovery step."""
-        await self.async_set_unique_id(discovery_info.address)
-        self._abort_if_unique_id_configured()
-        self._discovery_info = discovery_info
-        if self._manager is None:
-            self._manager = HASSTuyaBLEDeviceManager(self.hass, self._data)
-        await self._manager.build_cache()
-        self.context["title_placeholders"] = {
-            "name": await get_device_readable_name(
-                discovery_info,
-                self._manager,
-            )
-        }
-        return await self.async_step_login()
-
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the user step."""
-        if self._manager is None:
-            self._manager = HASSTuyaBLEDeviceManager(self.hass, self._data)
-        await self._manager.build_cache()
-        return await self.async_step_login()
-
-    async def async_step_login(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the Tuya IOT platform login step."""
-        data: dict[str, Any] | None = None
-        errors: dict[str, str] = {}
-        placeholders: dict[str, Any] = {}
-
-        if user_input is not None:
-            data = await _try_login(
-                self._manager,
-                user_input,
-                errors,
-                placeholders,
-            )
-            if data:
-                self._data.update(data)
-                self._manager.data.update(data)
-                return await self.async_step_device()
-
-        if user_input is None:
-            user_input = {}
-            if self._discovery_info:
-                await self._manager.get_device_credentials(
-                    self._discovery_info.address,
-                    False,
-                    True,
-                )
-            if self._data is None or len(self._data) == 0:
-                self._manager.get_login_from_cache()
-            if self._data is not None and len(self._data) > 0:
-                user_input.update(self._data)
-
-        return _show_login_form(self, user_input, errors, placeholders)
-
-    async def async_step_device(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the user step to pick discovered device."""
-        errors: dict[str, str] = {}
-
-        if user_input is not None:
-            address = user_input[CONF_ADDRESS]
-            discovery_info = self._discovered_devices[address]
-            local_name = await get_device_readable_name(discovery_info, self._manager)
-            await self.async_set_unique_id(
-                discovery_info.address, raise_on_progress=False
-            )
-            self._abort_if_unique_id_configured()
-            credentials = await self._manager.get_device_credentials(
-                discovery_info.address, self._get_device_info_error, True
-            )
-            self._data[CONF_ADDRESS] = discovery_info.address
-            if credentials is None:
-                self._get_device_info_error = True
-                errors["base"] = "device_not_registered"
-            else:
-                return self.async_create_entry(
-                    title=local_name,
-                    data={CONF_ADDRESS: discovery_info.address},
-                    options=self._data,
-                )
-
-        if discovery := self._discovery_info:
-            self._discovered_devices[discovery.address] = discovery
-        else:
-            current_addresses = self._async_current_ids()
-            for discovery in async_discovered_service_info(self.hass):
-                if (
-                    discovery.address in current_addresses
-                    or discovery.address in self._discovered_devices
-                    or discovery.service_data is None
-                    or not any(uuid in discovery.service_data for uuid in SERVICE_UUIDS)
-                ):
-                    continue
-                self._discovered_devices[discovery.address] = discovery
-
-        if not self._discovered_devices:
-            return self.async_abort(reason="no_unconfigured_devices")
-
-        def_address: str
-        if user_input:
-            def_address = user_input.get(CONF_ADDRESS)
-        else:
-            def_address = list(self._discovered_devices)[0]
-
-        return self.async_show_form(
-            step_id="device",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_ADDRESS,
-                        default=def_address,
-                    ): vol.In(
-                        {
-                            service_info.address: await get_device_readable_name(
-                                service_info,
-                                self._manager,
-                            )
-                            for service_info in self._discovered_devices.values()
-                        }
-                    ),
-                },
-            ),
-            errors=errors,
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["connection_settings", "login"],
         )
 
-    @staticmethod
-    @callback
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> TuyaBLEOptionsFlow:
-        """Get the options flow for this handler."""
-        return TuyaBLEOptionsFlow(config_entry)
+    async def async_step_connection_settings(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Manage connection mode and Home Assistant BLE control."""
+        errors: dict[str, str] = {}
+        domain_data = self.hass.data.get(DOMAIN, {})
+        entry_data: TuyaBLEData | None = domain_data.get(self._entry.entry_id)
+        supports_hold_time = bool(
+            entry_data and entry_data.device.supports_on_demand_connection_hold_time
+        )
+        if user_input is not None:
+            hold_time_supplied = CONF_ON_DEMAND_CONNECTION_HOLD_TIME in user_input
+            raw_mode = user_input.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+            raw_enabled = user_input.get(
+                CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+            )
+            raw_hold_time = user_input.get(
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                (
+                    entry_data.device.on_demand_connection_hold_time
+                    if supports_hold_time and entry_data
+                    else DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME
+                ),
+            )
+            try:
+                mode = ConnectionMode(raw_mode)
+                if not isinstance(raw_enabled, bool):
+                    raise ValueError
+                hold_time = (
+                    validate_on_demand_connection_hold_time(raw_hold_time)
+                    if supports_hold_time and hold_time_supplied
+                    else None
+                )
+            except (OverflowError, TypeError, ValueError):
+                errors["base"] = "ble_policy_transition_failed"
+            else:
+                try:
+                    if entry_data:
+                        policy_updates: dict[str, Any] = {
+                            "connection_mode": mode.value,
+                            "ble_control_enabled": raw_enabled,
+                        }
+                        if hold_time is not None:
+                            policy_updates[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] = (
+                                hold_time
+                            )
+                        await entry_data.device.async_update_connection_policy(
+                            **policy_updates
+                        )
+                except Exception:  # noqa: BLE001
+                    errors["base"] = "ble_policy_transition_failed"
+                else:
+                    options = dict(self._entry.options)
+                    options.update(
+                        {
+                            CONF_CONNECTION_MODE: mode.value,
+                            CONF_BLE_CONTROL_ENABLED: raw_enabled,
+                        }
+                    )
+                    if hold_time is not None:
+                        options[CONF_ON_DEMAND_CONNECTION_HOLD_TIME] = hold_time
+                    return self.async_create_entry(
+                        title=self._entry.title,
+                        data=options,
+                    )
+
+        options = self._entry.options
+        try:
+            default_mode = ConnectionMode(
+                options.get(CONF_CONNECTION_MODE, DEFAULT_CONNECTION_MODE)
+            ).value
+        except (TypeError, ValueError):
+            default_mode = DEFAULT_CONNECTION_MODE
+        default_enabled = options.get(
+            CONF_BLE_CONTROL_ENABLED, DEFAULT_BLE_CONTROL_ENABLED
+        )
+        if not isinstance(default_enabled, bool):
+            default_enabled = DEFAULT_BLE_CONTROL_ENABLED
+        default_hold_time = normalize_on_demand_connection_hold_time(
+            options.get(
+                CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                DEFAULT_ON_DEMAND_CONNECTION_HOLD_TIME,
+            )
+        )
+        schema: dict[vol.Marker, object] = {
+            vol.Required(
+                CONF_CONNECTION_MODE,
+                default=default_mode,
+            ): vol.In([mode.value for mode in ConnectionMode]),
+            vol.Required(
+                CONF_BLE_CONTROL_ENABLED,
+                default=default_enabled,
+            ): bool,
+        }
+        if supports_hold_time:
+            schema[
+                vol.Required(
+                    CONF_ON_DEMAND_CONNECTION_HOLD_TIME,
+                    default=default_hold_time,
+                )
+            ] = vol.All(
+                int,
+                vol.Range(
+                    min
